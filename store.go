@@ -133,6 +133,9 @@ func WithLogger(log *logrus.Logger) Option {
 	}
 }
 
+// WithPrometheus causes the store to generate Prometheus metrics.
+// The created metrics are passed to the given function, so they can be registered through prometheus.Register(),
+// unregistered through prometheus.Unregister() or registered with a custom registry.
 func WithPrometheus(collectorReceiver func(collectors []prometheus.Collector)) Option {
 	return func(config *Config) {
 		config.PrometheusCollectorReceiver = collectorReceiver
