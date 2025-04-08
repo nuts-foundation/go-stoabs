@@ -1,7 +1,6 @@
 module github.com/nuts-foundation/go-stoabs
 
-go 1.23
-toolchain go1.24.1
+go 1.24
 
 require (
 	github.com/alicebob/miniredis/v2 v2.34.0
