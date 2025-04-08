@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/prometheus/client_golang/prometheus"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -96,9 +97,10 @@ type Option func(config *Config)
 
 // Config specifies the configuration for a KVStore.
 type Config struct {
-	Log                *logrus.Logger
-	NoSync             bool
-	LockAcquireTimeout time.Duration
+	Log                         *logrus.Logger
+	NoSync                      bool
+	LockAcquireTimeout          time.Duration
+	PrometheusCollectorReceiver func(collectors []prometheus.Collector)
 }
 
 // DefaultConfig returns the default configuration.
@@ -128,6 +130,12 @@ func WithNoSync() Option {
 func WithLogger(log *logrus.Logger) Option {
 	return func(config *Config) {
 		config.Log = log
+	}
+}
+
+func WithPrometheus(collectorReceiver func(collectors []prometheus.Collector)) Option {
+	return func(config *Config) {
+		config.PrometheusCollectorReceiver = collectorReceiver
 	}
 }
 

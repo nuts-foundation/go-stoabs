@@ -23,9 +23,12 @@ import (
 	"errors"
 	"fmt"
 	"github.com/nuts-foundation/go-stoabs/kvtests"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
 	"github.com/sirupsen/logrus/hooks/test"
+	"github.com/stretchr/testify/require"
 	"go.etcd.io/bbolt"
+	"os"
 	"path"
 	"path/filepath"
 	"testing"
@@ -95,8 +98,58 @@ func TestBBolt_WriteShelf(t *testing.T) {
 	})
 }
 
-func createStore(t *testing.T) (stoabs.KVStore, error) {
-	store, err := CreateBBoltStore(path.Join(util.TestDirectory(t), "bbolt.db"), stoabs.WithNoSync())
+func TestBBolt_PrometheusMetrics(t *testing.T) {
+	createStoreWithStats := func(t *testing.T) stoabs.KVStore {
+		var collectors []prometheus.Collector
+		store, _ := createStore(t, stoabs.WithPrometheus(func(c []prometheus.Collector) {
+			collectors = c
+		}), stoabs.WithNoSync())
+		for _, collector := range collectors {
+			t.Cleanup(func() {
+				prometheus.Unregister(collector)
+			})
+			require.NoError(t, prometheus.Register(collector))
+		}
+		return store
+	}
+
+	ctx := context.Background()
+	t.Run("write TX metrics", func(t *testing.T) {
+		err := createStoreWithStats(t).WriteShelf(ctx, shelf, func(writer stoabs.Writer) error {
+			return writer.Put(stoabs.BytesKey(key), value)
+		})
+		assert.NoError(t, err)
+		stats := getPrometheusStats(t)
+		assert.Contains(t, stats, "bbolt_tx_acquisition_duration_seconds_count{type=\"write\"} 1")
+		assert.Contains(t, stats, "bbolt_tx_commit_duration_seconds_count 1")
+		assert.Contains(t, stats, "bbolt_tx_duration_seconds_count{type=\"write\"} 1")
+		assert.NotContains(t, stats, "bbolt_tx_acquisition_duration_seconds_count{type=\"read\"}")
+	})
+	t.Run("read TX metrics", func(t *testing.T) {
+		_ = createStoreWithStats(t).ReadShelf(ctx, shelf, func(reader stoabs.Reader) error {
+			_, err := reader.Get(stoabs.BytesKey(key))
+			return err
+		})
+		stats := getPrometheusStats(t)
+		assert.Contains(t, stats, "bbolt_tx_acquisition_duration_seconds_count{type=\"read\"} 1")
+		assert.Contains(t, stats, "bbolt_tx_duration_seconds_count{type=\"read\"} 1")
+	})
+}
+
+func getPrometheusStats(t *testing.T) string {
+	fileName := path.Join(t.TempDir(), "prometheus.txt")
+	err := prometheus.WriteToTextfile(fileName, prometheus.Gatherers{prometheus.DefaultGatherer})
+	require.NoError(t, err)
+	data, err := os.ReadFile(fileName)
+	require.NoError(t, err)
+	return string(data)
+}
+
+func createStore(t *testing.T, opts ...stoabs.Option) (stoabs.KVStore, error) {
+	if opts == nil {
+		opts = []stoabs.Option{stoabs.WithNoSync()}
+	}
+	store, err := CreateBBoltStore(path.Join(util.TestDirectory(t), "bbolt.db"), opts...)
 	t.Cleanup(func() {
 		_ = store.Close(context.Background())
 	})
