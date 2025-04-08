@@ -1,6 +1,7 @@
 module github.com/nuts-foundation/go-stoabs
 
-go 1.23
+go 1.24
+
 require (
 	github.com/alicebob/miniredis/v2 v2.34.0
 	github.com/dgraph-io/badger/v4 v4.6.0
@@ -9,7 +10,7 @@ require (
 	github.com/sirupsen/logrus v1.9.3
 	github.com/stretchr/testify v1.10.0
 	go.etcd.io/bbolt v1.4.0
-	go.uber.org/mock v0.5.0
+	go.uber.org/mock v0.5.1
 )
 
 require (
