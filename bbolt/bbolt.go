@@ -22,6 +22,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/prometheus/client_golang/prometheus"
 	"os"
 	"path"
 	"time"
@@ -88,19 +89,49 @@ func createBBoltStore(filePath string, options *bbolt.Options, cfg stoabs.Config
 
 // Wrap creates a KVStore using an existing bbolt.db
 func Wrap(db *bbolt.DB, cfg stoabs.Config) stoabs.KVStore {
-	return &store{
+	result := &store{
 		db:   db,
 		cfg:  cfg,
 		log:  cfg.Log,
 		lock: &util.ContextRWLocker{},
 	}
+	if cfg.PrometheusCollectorReceiver != nil {
+		// Create following metrics:
+		// - Histogram for transaction acquisition time (vector for read transaction and write transaction)
+		// - Histogram for transaction commit time
+		// - Histogram for write transaction duration
+		result.promTXAcquisitionDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "bbolt_tx_acquisition_duration_seconds",
+			Help:    "Duration of BBolt transaction acquisition in seconds (experimental, may be removed without notice)",
+			Buckets: prometheus.DefBuckets,
+		}, []string{"type"})
+		result.promTXCommitDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "bbolt_tx_commit_duration_seconds",
+			Help:    "Duration of BBolt transaction commit in seconds (experimental, may be removed without notice)",
+			Buckets: prometheus.DefBuckets,
+		})
+		result.promTXDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "bbolt_tx_duration_seconds",
+			Help:    "Duration of BBolt transaction in seconds (experimental, may be removed without notice)",
+			Buckets: prometheus.DefBuckets,
+		}, []string{"type"})
+		cfg.PrometheusCollectorReceiver([]prometheus.Collector{
+			result.promTXAcquisitionDuration,
+			result.promTXCommitDuration,
+			result.promTXDuration,
+		})
+	}
+	return result
 }
 
 type store struct {
-	db   *bbolt.DB
-	log  *logrus.Logger
-	lock *util.ContextRWLocker
-	cfg  stoabs.Config
+	db                        *bbolt.DB
+	log                       *logrus.Logger
+	lock                      *util.ContextRWLocker
+	cfg                       stoabs.Config
+	promTXAcquisitionDuration *prometheus.HistogramVec
+	promTXCommitDuration      prometheus.Histogram
+	promTXDuration            *prometheus.HistogramVec
 }
 
 func (b *store) Close(ctx context.Context) error {
@@ -143,13 +174,17 @@ func (b *store) doTX(ctx context.Context, fn func(tx *bbolt.Tx) error, writable 
 	var unlock func()
 	lockCtx, lockCtxCancel := context.WithTimeout(ctx, b.cfg.LockAcquireTimeout)
 	defer lockCtxCancel()
+	txAcquisitionStartTime := time.Now()
+	var txType string
 	if writable {
+		txType = "write"
 		err := b.lock.LockContext(lockCtx)
 		if err != nil {
 			return fmt.Errorf("unable to obtain BBolt write lock: %w", err)
 		}
 		unlock = b.lock.Unlock
 	} else {
+		txType = "read"
 		err := b.lock.RLockContext(lockCtx)
 		if err != nil {
 			return fmt.Errorf("unable to obtain BBolt read lock: %w", err)
@@ -166,9 +201,16 @@ func (b *store) doTX(ctx context.Context, fn func(tx *bbolt.Tx) error, writable 
 		}
 		return stoabs.DatabaseError(err)
 	}
+	if b.promTXAcquisitionDuration != nil {
+		b.promTXAcquisitionDuration.WithLabelValues(txType).Observe(time.Since(txAcquisitionStartTime).Seconds())
+	}
 
 	// Perform TX action(s)
+	var txDurationStartTime = time.Now()
 	appError := fn(dbTX)
+	if b.promTXDuration != nil {
+		b.promTXDuration.WithLabelValues(txType).Observe(time.Since(txDurationStartTime).Seconds())
+	}
 
 	// Writable TXs should be committed, non-writable TXs rolled back
 	if !writable {
@@ -187,16 +229,21 @@ func (b *store) doTX(ctx context.Context, fn func(tx *bbolt.Tx) error, writable 
 
 	b.log.Trace("Committing BBolt transaction")
 	// Check context cancellation, if not cancelled/expired; commit.
+	var txCommitStartTime time.Time
 	if ctx.Err() != nil {
 		err = ctx.Err()
 		rollbackTX(dbTX, b.log)
 	} else {
+		txCommitStartTime = time.Now()
 		err = dbTX.Commit()
 	}
 	if err != nil {
 		unlock()
 		stoabs.OnRollbackOption{}.Invoke(opts)
 		return util.WrapError(stoabs.ErrCommitFailed, err)
+	}
+	if b.promTXCommitDuration != nil {
+		b.promTXCommitDuration.Observe(time.Since(txCommitStartTime).Seconds())
 	}
 
 	unlock()
