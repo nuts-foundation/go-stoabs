@@ -8,7 +8,7 @@ require (
 	github.com/go-redsync/redsync/v4 v4.13.0
 	github.com/redis/go-redis/v9 v9.12.1
 	github.com/sirupsen/logrus v1.9.3
-	github.com/stretchr/testify v1.10.0
+	github.com/stretchr/testify v1.11.1
 	go.etcd.io/bbolt v1.4.3
 	go.uber.org/mock v0.5.2
 )
