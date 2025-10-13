@@ -1,12 +1,12 @@
 module github.com/nuts-foundation/go-stoabs
 
-go 1.24
+go 1.24.0
 
 require (
 	github.com/alicebob/miniredis/v2 v2.34.0
 	github.com/dgraph-io/badger/v4 v4.6.0
-	github.com/go-redsync/redsync/v4 v4.13.0
-	github.com/redis/go-redis/v9 v9.12.1
+	github.com/go-redsync/redsync/v4 v4.14.0
+	github.com/redis/go-redis/v9 v9.14.0
 	github.com/sirupsen/logrus v1.9.3
 	github.com/stretchr/testify v1.11.1
 	go.etcd.io/bbolt v1.4.3
