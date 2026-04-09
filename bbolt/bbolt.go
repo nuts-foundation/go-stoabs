@@ -89,18 +89,18 @@ func createBBoltStore(filePath string, options *bbolt.Options, cfg stoabs.Config
 // Wrap creates a KVStore using an existing bbolt.db
 func Wrap(db *bbolt.DB, cfg stoabs.Config) stoabs.KVStore {
 	return &store{
-		db:   db,
-		cfg:  cfg,
-		log:  cfg.Log,
-		lock: &util.ContextRWLocker{},
+		db:        db,
+		cfg:       cfg,
+		log:       cfg.Log,
+		writeLock: &util.ContextLocker{},
 	}
 }
 
 type store struct {
-	db   *bbolt.DB
-	log  *logrus.Logger
-	lock *util.ContextRWLocker
-	cfg  stoabs.Config
+	db        *bbolt.DB
+	log       *logrus.Logger
+	writeLock *util.ContextLocker
+	cfg       stoabs.Config
 }
 
 func (b *store) Close(ctx context.Context) error {
@@ -140,21 +140,20 @@ func (b *store) ReadShelf(ctx context.Context, shelfName string, fn func(reader 
 }
 
 func (b *store) doTX(ctx context.Context, fn func(tx *bbolt.Tx) error, writable bool, opts []stoabs.TxOption) error {
-	var unlock func()
-	lockCtx, lockCtxCancel := context.WithTimeout(ctx, b.cfg.LockAcquireTimeout)
-	defer lockCtxCancel()
+	// Only acquire a lock for write transactions. Read transactions don't need a Go-level lock
+	// because BBolt natively supports concurrent reads: read transactions acquire mmaplock.RLock()
+	// which does not interact with the write lock (rwlock). Adding an RWMutex here would cause
+	// Go's writer-preference semantics to block readers when a writer is pending, which is worse
+	// than BBolt's native behavior where reads never block on writes.
+	unlock := func() {} // no-op for read transactions
 	if writable {
-		err := b.lock.LockContext(lockCtx)
+		lockCtx, lockCtxCancel := context.WithTimeout(ctx, b.cfg.LockAcquireTimeout)
+		defer lockCtxCancel()
+		err := b.writeLock.LockContext(lockCtx)
 		if err != nil {
 			return fmt.Errorf("unable to obtain BBolt write lock: %w", err)
 		}
-		unlock = b.lock.Unlock
-	} else {
-		err := b.lock.RLockContext(lockCtx)
-		if err != nil {
-			return fmt.Errorf("unable to obtain BBolt read lock: %w", err)
-		}
-		unlock = b.lock.RUnlock
+		unlock = b.writeLock.Unlock
 	}
 
 	// Start transaction, retrieve/create shelf to operate on
@@ -173,7 +172,6 @@ func (b *store) doTX(ctx context.Context, fn func(tx *bbolt.Tx) error, writable 
 	// Writable TXs should be committed, non-writable TXs rolled back
 	if !writable {
 		rollbackTX(dbTX, b.log)
-		unlock()
 		return appError
 	}
 	// Observe result, commit/rollback

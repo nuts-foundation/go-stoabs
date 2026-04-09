@@ -125,3 +125,22 @@ func (c *ContextRWLocker) Unlock() {
 func (c *ContextRWLocker) RUnlock() {
 	c.mux.RUnlock()
 }
+
+// ContextLocker provides a Mutex that supports context cancellation.
+// Unlike ContextRWLocker, it only provides exclusive locking (no read lock).
+// This is appropriate when only write serialization is needed and reads are handled natively by the underlying store.
+type ContextLocker struct {
+	mux sync.Mutex
+}
+
+// LockContext locks the Mutex with the given context.
+// If the context is canceled the function will return immediately with the error from the context.
+// It will still acquire the lock in the background, but it will be released immediately.
+func (c *ContextLocker) LockContext(ctx context.Context) error {
+	return lockWithCancel(ctx, c.mux.Lock, c.mux.Unlock)
+}
+
+// Unlock releases the Mutex.
+func (c *ContextLocker) Unlock() {
+	c.mux.Unlock()
+}
