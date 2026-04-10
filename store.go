@@ -98,7 +98,18 @@ type Option func(config *Config)
 type Config struct {
 	Log                *logrus.Logger
 	NoSync             bool
+	// SyncInterval specifies how often pending writes should be flushed to disk, instead of flushing after every
+	// transaction commit. This can significantly improve write throughput at the cost of potentially losing the last
+	// interval's worth of writes on an unclean shutdown. If zero, writes are flushed after every commit.
+	// Support depends on the underlying database. Ignored when NoSync is true.
+	SyncInterval       time.Duration
 	LockAcquireTimeout time.Duration
+}
+
+// DelayedSync reports whether writes should be buffered and flushed on a timer
+// rather than synced after every commit.
+func (c Config) DelayedSync() bool {
+	return c.SyncInterval > 0 && !c.NoSync
 }
 
 // DefaultConfig returns the default configuration.
@@ -121,6 +132,16 @@ func WithLockAcquireTimeout(value time.Duration) Option {
 func WithNoSync() Option {
 	return func(config *Config) {
 		config.NoSync = true
+	}
+}
+
+// WithSyncInterval specifies that the database should flush pending writes to disk at most at the given interval,
+// rather than after every transaction commit. This can significantly improve write throughput at the cost of
+// potentially losing the last interval's worth of writes on an unclean shutdown.
+// Support depends on the underlying database.
+func WithSyncInterval(interval time.Duration) Option {
+	return func(config *Config) {
+		config.SyncInterval = interval
 	}
 }
 

@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"sync/atomic"
 	"time"
 
 	"github.com/nuts-foundation/go-stoabs"
@@ -50,6 +51,11 @@ func CreateBBoltStore(filePath string, opts ...stoabs.Option) (stoabs.KVStore, e
 
 	bboltOpts := *bbolt.DefaultOptions
 	if cfg.NoSync {
+		bboltOpts.NoSync = true
+		bboltOpts.NoFreelistSync = true
+		bboltOpts.NoGrowSync = true
+	} else if cfg.DelayedSync() {
+		// Disable bbolt's per-commit syncs; we will sync on a timer instead.
 		bboltOpts.NoSync = true
 		bboltOpts.NoFreelistSync = true
 		bboltOpts.NoGrowSync = true
@@ -88,23 +94,44 @@ func createBBoltStore(filePath string, options *bbolt.Options, cfg stoabs.Config
 
 // Wrap creates a KVStore using an existing bbolt.db
 func Wrap(db *bbolt.DB, cfg stoabs.Config) stoabs.KVStore {
-	return &store{
+	s := &store{
 		db:   db,
 		cfg:  cfg,
 		log:  cfg.Log,
 		lock: &util.ContextRWLocker{},
 	}
+	if cfg.DelayedSync() {
+		ctx, cancelCtx := context.WithCancel(context.Background())
+		s.cancelCtx = cancelCtx
+		s.startSync(ctx, cfg.SyncInterval)
+	}
+	return s
 }
 
 type store struct {
-	db   *bbolt.DB
-	log  *logrus.Logger
-	lock *util.ContextRWLocker
-	cfg  stoabs.Config
+	db        *bbolt.DB
+	log       *logrus.Logger
+	lock      *util.ContextRWLocker
+	cfg       stoabs.Config
+	mustSync  atomic.Bool
+	cancelCtx context.CancelFunc
 }
 
 func (b *store) Close(ctx context.Context) error {
-	err := util.CallWithTimeout(ctx, b.db.Close, func() {
+	err := util.CallWithTimeout(ctx, func() error {
+		// Stop the background sync goroutine before flushing so it cannot
+		// race with our explicit Sync call below.
+		if b.cancelCtx != nil {
+			b.cancelCtx()
+		}
+		// Flush any writes that were committed since the last periodic sync.
+		if b.mustSync.Swap(false) {
+			if err := b.db.Sync(); err != nil {
+				return fmt.Errorf("could not flush to disk: %w", err)
+			}
+		}
+		return b.db.Close()
+	}, func() {
 		b.log.Error("Closing of BBolt store timed out, store may not shut down correctly.")
 	})
 	if err != nil {
@@ -199,9 +226,33 @@ func (b *store) doTX(ctx context.Context, fn func(tx *bbolt.Tx) error, writable 
 		return util.WrapError(stoabs.ErrCommitFailed, err)
 	}
 
+	// Mark that there are unflushed writes, so the sync goroutine (or Close) will flush them.
+	if b.cfg.DelayedSync() {
+		b.mustSync.Store(true)
+	}
+
 	unlock()
 	stoabs.AfterCommitOption{}.Invoke(opts)
 	return nil
+}
+
+func (b *store) startSync(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if b.mustSync.Swap(false) {
+					if err := b.db.Sync(); err != nil {
+						b.log.WithError(err).Error("Failed to sync BBolt store to disk")
+					}
+				}
+			}
+		}
+	}()
 }
 
 func rollbackTX(dbTX *bbolt.Tx, log *logrus.Logger) {
