@@ -137,6 +137,87 @@ func TestBBolt_CreateBBoltStore(t *testing.T) {
 	})
 }
 
+func TestBBolt_SyncInterval(t *testing.T) {
+	ctx := context.Background()
+	const numEntries = 100
+	data := make([]byte, 1024)
+
+	t.Run("data is flushed on close when dirty", func(t *testing.T) {
+		dbPath := path.Join(util.TestDirectory(t), "bbolt.db")
+		store, _ := CreateBBoltStore(dbPath, stoabs.WithSyncInterval(time.Second))
+
+		for i := 0; i < numEntries; i++ {
+			err := store.WriteShelf(ctx, shelf, func(writer stoabs.Writer) error {
+				return writer.Put(stoabs.BytesKey(fmt.Sprintf("%d", i)), data)
+			})
+			if !assert.NoError(t, err) {
+				return
+			}
+		}
+		assert.NoError(t, store.Close(ctx))
+
+		// Reopen and verify all entries survived the close
+		store, _ = CreateBBoltStore(dbPath, stoabs.WithSyncInterval(time.Second))
+		defer store.Close(ctx)
+		err := store.ReadShelf(ctx, shelf, func(reader stoabs.Reader) error {
+			assert.Equal(t, uint(numEntries), reader.Stats().NumEntries)
+			return nil
+		})
+		assert.NoError(t, err)
+	})
+
+	t.Run("data is flushed periodically", func(t *testing.T) {
+		dbPath := path.Join(util.TestDirectory(t), "bbolt.db")
+		kvStore, _ := CreateBBoltStore(dbPath, stoabs.WithSyncInterval(50*time.Millisecond))
+
+		err := kvStore.WriteShelf(ctx, shelf, func(writer stoabs.Writer) error {
+			return writer.Put(stoabs.BytesKey("key"), data)
+		})
+		assert.NoError(t, err)
+
+		// Wait for the periodic sync to fire
+		util.WaitFor(t, func() (bool, error) {
+			return !kvStore.(*store).mustSync.Load(), nil
+		}, time.Second, "timed out waiting for periodic sync")
+
+		assert.NoError(t, kvStore.Close(ctx))
+	})
+}
+
+func BenchmarkBBolt_Flush(b *testing.B) {
+	ctx := context.Background()
+	const numEntries = 10
+	data := make([]byte, 1024)
+
+	b.Run("sync on every commit", func(b *testing.B) {
+		dbPath := path.Join(b.TempDir(), "bbolt.db")
+		kvStore, _ := CreateBBoltStore(dbPath)
+		b.ResetTimer()
+		for x := 0; x < b.N; x++ {
+			for i := 0; i < numEntries; i++ {
+				_ = kvStore.WriteShelf(ctx, shelf, func(writer stoabs.Writer) error {
+					return writer.Put(stoabs.BytesKey(fmt.Sprintf("%d", i)), data)
+				})
+			}
+		}
+		_ = kvStore.Close(ctx)
+	})
+
+	b.Run("sync at interval", func(b *testing.B) {
+		dbPath := path.Join(b.TempDir(), "bbolt.db")
+		kvStore, _ := CreateBBoltStore(dbPath, stoabs.WithSyncInterval(time.Second))
+		b.ResetTimer()
+		for x := 0; x < b.N; x++ {
+			for i := 0; i < numEntries; i++ {
+				_ = kvStore.WriteShelf(ctx, shelf, func(writer stoabs.Writer) error {
+					return writer.Put(stoabs.BytesKey(fmt.Sprintf("%d", i)), data)
+				})
+			}
+		}
+		_ = kvStore.Close(ctx)
+	})
+}
+
 func TestBBolt_Close(t *testing.T) {
 	ctx := context.Background()
 	var bytesKey = stoabs.BytesKey([]byte{1, 2, 3})
