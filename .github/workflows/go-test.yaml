@@ -1,0 +1,29 @@
+name: Go
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Display Go version
+        run: go version
+      - name: Build
+        run: go build -v ./...
+      - name: Test
+        run: go test -race -v ./...
