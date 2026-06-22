@@ -1,11 +1,11 @@
 module github.com/nuts-foundation/go-stoabs
 
-go 1.24
+go 1.24.9
 
 require (
 	github.com/alicebob/miniredis/v2 v2.38.0
 	github.com/dgraph-io/badger/v4 v4.6.0
-	github.com/go-redsync/redsync/v4 v4.13.0
+	github.com/go-redsync/redsync/v4 v4.16.0
 	github.com/redis/go-redis/v9 v9.20.1
 	github.com/sirupsen/logrus v1.9.3
 	github.com/stretchr/testify v1.11.1
@@ -33,7 +33,7 @@ require (
 	go.opentelemetry.io/otel/trace v1.34.0 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
 	golang.org/x/net v0.38.0 // indirect
-	golang.org/x/sys v0.31.0 // indirect
+	golang.org/x/sys v0.39.0 // indirect
 	google.golang.org/protobuf v1.36.5 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
