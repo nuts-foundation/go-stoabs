@@ -138,7 +138,7 @@ func TestBadger_CreateBadgerStore(t *testing.T) {
 
 		_, err = CreateBadgerStore(filename, stoabs.WithLogger(logger)) // hangs while store1 is open
 
-		assert.EqualError(t, err, fmt.Sprintf("Cannot acquire directory lock on \"%s\".  Another process is using this Badger database. error: resource temporarily unavailable", filename))
+		assert.EqualError(t, err, fmt.Sprintf("Cannot acquire directory lock on \"%s\".  Another process is using this Badger database. err: resource temporarily unavailable", filename))
 	})
 }
 
