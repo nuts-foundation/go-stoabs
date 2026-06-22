@@ -1,15 +1,15 @@
 module github.com/nuts-foundation/go-stoabs
 
-go 1.24.9
+go 1.25.0
 
 require (
 	github.com/alicebob/miniredis/v2 v2.38.0
 	github.com/dgraph-io/badger/v4 v4.9.2
 	github.com/go-redsync/redsync/v4 v4.16.0
-	github.com/redis/go-redis/v9 v9.20.1
-	github.com/sirupsen/logrus v1.9.3
+	github.com/redis/go-redis/v9 v9.21.0
+	github.com/sirupsen/logrus v1.9.4
 	github.com/stretchr/testify v1.11.1
-	go.etcd.io/bbolt v1.4.3
+	go.etcd.io/bbolt v1.5.0
 	go.uber.org/mock v0.6.0
 )
 
@@ -31,7 +31,7 @@ require (
 	go.opentelemetry.io/otel/metric v1.41.0 // indirect
 	go.opentelemetry.io/otel/trace v1.41.0 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
-	golang.org/x/sys v0.39.0 // indirect
+	golang.org/x/sys v0.45.0 // indirect
 	google.golang.org/protobuf v1.36.7 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
