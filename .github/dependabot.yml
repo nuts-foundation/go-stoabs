@@ -5,4 +5,11 @@ updates:
     # checks /go.mod
     directory: "/"
     schedule:
-      interval: "daily"
+      interval: "weekly"
+    groups:
+      go-modules:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
