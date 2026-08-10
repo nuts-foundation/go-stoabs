@@ -4,9 +4,9 @@ go 1.25.0
 
 require (
 	github.com/alicebob/miniredis/v2 v2.38.0
-	github.com/dgraph-io/badger/v4 v4.9.2
-	github.com/go-redsync/redsync/v4 v4.16.0
-	github.com/redis/go-redis/v9 v9.21.0
+	github.com/dgraph-io/badger/v4 v4.9.6
+	github.com/go-redsync/redsync/v4 v4.17.0
+	github.com/redis/go-redis/v9 v9.22.0
 	github.com/sirupsen/logrus v1.9.4
 	github.com/stretchr/testify v1.11.1
 	go.etcd.io/bbolt v1.5.0
@@ -21,8 +21,6 @@ require (
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/google/flatbuffers v25.2.10+incompatible // indirect
-	github.com/hashicorp/errwrap v1.1.0 // indirect
-	github.com/hashicorp/go-multierror v1.1.1 // indirect
 	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/yuin/gopher-lua v1.1.1 // indirect
