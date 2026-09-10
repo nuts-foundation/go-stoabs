@@ -22,7 +22,6 @@ import (
 	"context"
 	"github.com/nuts-foundation/go-stoabs"
 	"sync"
-	"sync/atomic"
 )
 
 // RWLocker defines the interface for a read-write lock like sync.RWMutex
@@ -57,10 +56,13 @@ func (c *ContextRWLocker) RLockContext(ctx context.Context) error {
 }
 
 func lockWithCancel(ctx context.Context, fnLock func(), fnUnlock func()) error {
-	locked := make(chan bool)
-	expired := &atomic.Value{}
+	// Buffered, so the locking goroutine never blocks on the send. If it did block while holding m,
+	// a caller that already committed to the ctx.Done() case would block on m forever (deadlock),
+	// and the acquired lock would never be released.
+	locked := make(chan struct{}, 1)
+	expired := false
 
-	// We need an additional mutex to synchronize signalling the locking goroutine the context expired.
+	// m synchronizes the locking goroutine with the context cancellation handler.
 	// Otherwise, if the context cancellation handler and locking goroutine execute concurrently,
 	// the context cancellation handler might return an error (which should cause an immediate unlock after acquiring the lock),
 	// which (the signal) might be lost when the locking goroutine is already finished (or just finishing).
@@ -70,11 +72,11 @@ func lockWithCancel(ctx context.Context, fnLock func(), fnUnlock func()) error {
 		fnLock()
 		m.Lock()
 		defer m.Unlock()
-		if expired.Load() != nil {
+		if expired {
 			// Context expired, unlock immediately.
 			fnUnlock()
 		} else {
-			locked <- true
+			locked <- struct{}{}
 		}
 	}()
 
@@ -83,7 +85,14 @@ func lockWithCancel(ctx context.Context, fnLock func(), fnUnlock func()) error {
 		m.Lock()
 		defer m.Unlock()
 		// context expired, signal to the locking goroutine to unlock immediately after acquiring the lock
-		expired.Store(true)
+		expired = true
+		select {
+		case <-locked:
+			// The lock was acquired after the select above committed to ctx.Done(), but before we took m.
+			// The locking goroutine has already signalled and will not unlock, so release the lock here.
+			fnUnlock()
+		default:
+		}
 		return stoabs.DatabaseError(ctx.Err())
 	case <-locked:
 		// we got the lock before the context expired
