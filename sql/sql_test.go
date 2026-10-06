@@ -143,6 +143,87 @@ func TestConformance(t *testing.T) {
 	}
 }
 
+// TestNestedReads covers what the Nuts node does and the generic conformance suite does not: callbacks of Iterate
+// and Range that query the same transaction again (nested Get), and iterating shelves larger than one page.
+// A streaming implementation fails this on Postgres, MySQL and SQL Server ("bad connection"/"commands out of sync").
+func TestNestedReads(t *testing.T) {
+	ctx := context.Background()
+	for _, d := range databases {
+		t.Run(d.name, func(t *testing.T) {
+			d.open(t).Close()
+			store, err := d.provider(t)(t)
+			require.NoError(t, err)
+			const n = pageSize + 5
+			require.NoError(t, store.Write(ctx, func(tx stoabs.WriteTx) error {
+				w := tx.GetShelfWriter("test")
+				o := tx.GetShelfWriter("other")
+				for i := 0; i < n; i++ {
+					require.NoError(t, w.Put(stoabs.Uint32Key(i), stoabs.Uint32Key(i).Bytes()))
+					require.NoError(t, o.Put(stoabs.Uint32Key(i), []byte{1}))
+				}
+				return nil
+			}))
+			t.Run("Iterate with nested Get on same and other shelf", func(t *testing.T) {
+				var count int
+				err := store.Read(ctx, func(tx stoabs.ReadTx) error {
+					test := tx.GetShelfReader("test")
+					other := tx.GetShelfReader("other")
+					return test.Iterate(func(key stoabs.Key, value []byte) error {
+						same, err := test.Get(key)
+						if err != nil {
+							return err
+						}
+						assert.Equal(t, value, same)
+						if _, err := other.Get(key); err != nil {
+							return err
+						}
+						count++
+						return nil
+					}, stoabs.Uint32Key(0))
+				})
+				require.NoError(t, err)
+				assert.Equal(t, n, count)
+			})
+			t.Run("Range with nested Get crossing a page boundary", func(t *testing.T) {
+				var keys []stoabs.Uint32Key
+				err := store.ReadShelf(ctx, "test", func(reader stoabs.Reader) error {
+					return reader.Range(stoabs.Uint32Key(3), stoabs.Uint32Key(n), func(key stoabs.Key, value []byte) error {
+						if _, err := reader.Get(key); err != nil {
+							return err
+						}
+						keys = append(keys, key.(stoabs.Uint32Key))
+						return nil
+					}, true)
+				})
+				require.NoError(t, err)
+				require.Len(t, keys, n-3)
+				assert.Equal(t, stoabs.Uint32Key(3), keys[0])
+				assert.Equal(t, stoabs.Uint32Key(n-1), keys[len(keys)-1])
+				// strictly ascending, no duplicates across pages
+				for i := 1; i < len(keys); i++ {
+					assert.Equal(t, keys[i-1]+1, keys[i])
+				}
+			})
+			t.Run("Iterate inside a write transaction sees buffered writes", func(t *testing.T) {
+				err := store.Write(ctx, func(tx stoabs.WriteTx) error {
+					w := tx.GetShelfWriter("test")
+					require.NoError(t, w.Put(stoabs.Uint32Key(n+1), []byte{9}))
+					var count int
+					if err := w.Iterate(func(_ stoabs.Key, _ []byte) error {
+						count++
+						return nil
+					}, stoabs.Uint32Key(0)); err != nil {
+						return err
+					}
+					assert.Equal(t, n+1, count)
+					return errors.New("rollback")
+				})
+				assert.EqualError(t, err, "rollback")
+			})
+		})
+	}
+}
+
 func TestSQLite_Specifics(t *testing.T) {
 	ctx := context.Background()
 	newStore := func(t *testing.T) stoabs.KVStore {

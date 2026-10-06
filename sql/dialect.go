@@ -40,6 +40,8 @@ type Dialect interface {
 	Upsert(table string, rows int) string
 	// ByteLength returns the SQL expression that yields the length in bytes of the given (binary) column.
 	ByteLength(column string) string
+	// LimitSuffix returns the clause, appended after ORDER BY, that limits a query to the given number of rows.
+	LimitSuffix(rows int) string
 	// ReadTxOptions returns the options for read-only transactions, or nil for the database default.
 	ReadTxOptions() *sql.TxOptions
 	// WriteTxOptions returns the options for writable transactions, or nil for the database default.
@@ -93,6 +95,7 @@ func (d sqliteDialect) Upsert(table string, rows int) string {
 		d.QuoteIdentifier(keyColumn), d.QuoteIdentifier(valueColumn), d.QuoteIdentifier(valueColumn))
 }
 func (sqliteDialect) ByteLength(column string) string { return "length(" + column + ")" }
+func (sqliteDialect) LimitSuffix(rows int) string     { return "LIMIT " + strconv.Itoa(rows) }
 func (sqliteDialect) ReadTxOptions() *sql.TxOptions   { return nil }
 func (sqliteDialect) WriteTxOptions() *sql.TxOptions  { return nil }
 
@@ -107,6 +110,7 @@ func (d postgresDialect) Upsert(table string, rows int) string {
 		d.QuoteIdentifier(keyColumn), d.QuoteIdentifier(valueColumn), d.QuoteIdentifier(valueColumn))
 }
 func (postgresDialect) ByteLength(column string) string { return "length(" + column + ")" }
+func (postgresDialect) LimitSuffix(rows int) string     { return "LIMIT " + strconv.Itoa(rows) }
 func (postgresDialect) ReadTxOptions() *sql.TxOptions {
 	// Snapshot semantics for reads, like a bbolt read transaction.
 	return &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true}
@@ -126,6 +130,7 @@ func (d mysqlDialect) Upsert(table string, rows int) string {
 		d.QuoteIdentifier(valueColumn), d.QuoteIdentifier(valueColumn))
 }
 func (mysqlDialect) ByteLength(column string) string { return "LENGTH(" + column + ")" }
+func (mysqlDialect) LimitSuffix(rows int) string     { return "LIMIT " + strconv.Itoa(rows) }
 func (mysqlDialect) ReadTxOptions() *sql.TxOptions {
 	// InnoDB's default is REPEATABLE READ, which gives a consistent snapshot per transaction.
 	return &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true}
@@ -147,6 +152,9 @@ func (d sqlServerDialect) Upsert(table string, rows int) string {
 		d.QuoteIdentifier(keyColumn), d.QuoteIdentifier(valueColumn))
 }
 func (sqlServerDialect) ByteLength(column string) string { return "DATALENGTH(" + column + ")" }
+func (sqlServerDialect) LimitSuffix(rows int) string {
+	return "OFFSET 0 ROWS FETCH NEXT " + strconv.Itoa(rows) + " ROWS ONLY"
+}
 func (sqlServerDialect) ReadTxOptions() *sql.TxOptions {
 	// SNAPSHOT isolation requires ALLOW_SNAPSHOT_ISOLATION on the database, so stick to the default.
 	return nil

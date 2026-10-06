@@ -382,82 +382,132 @@ func (s *shelf) Stats() stoabs.ShelfStats {
 	return stoabs.ShelfStats{NumEntries: numEntries, ShelfSize: size}
 }
 
+// pageSize is the number of rows fetched per query by Iterate and Range.
+const pageSize = 1000
+
+type row struct {
+	key   []byte
+	value []byte
+}
+
+// scanPage runs a query that returns (key, value) rows and reads them all, closing the result set before returning.
+// Callbacks must never run while a result set is open: a nested query on the same transaction (e.g. a Get from
+// inside an Iterate callback) fails on Postgres, MySQL and SQL Server while rows are pending on the connection.
+func (s *shelf) scanPage(query string, args ...interface{}) ([]row, error) {
+	rows, err := s.tx.tx.QueryContext(s.tx.ctx, query, args...)
+	if err != nil {
+		return nil, stoabs.DatabaseError(err)
+	}
+	defer rows.Close()
+	page := make([]row, 0, pageSize)
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.key, &r.value); err != nil {
+			return nil, stoabs.DatabaseError(err)
+		}
+		if r.value == nil {
+			r.value = []byte{}
+		}
+		page = append(page, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, stoabs.DatabaseError(err)
+	}
+	return page, nil
+}
+
 func (s *shelf) Iterate(callback stoabs.CallerFn, keyType stoabs.Key) error {
 	if err := s.flush(); err != nil {
 		return err
 	}
-	rows, err := s.tx.tx.QueryContext(s.tx.ctx,
-		s.q("SELECT %s, %s FROM %s ORDER BY %s", s.key(), s.value(), s.table, s.key()))
-	if err != nil {
-		return stoabs.DatabaseError(err)
-	}
-	defer rows.Close()
-	for rows.Next() {
+	// Keyset pagination in key order: the first page has no lower bound, later pages continue after the last key seen.
+	first := s.q("SELECT %s, %s FROM %s ORDER BY %s %s",
+		s.key(), s.value(), s.table, s.key(), s.tx.store.dialect.LimitSuffix(pageSize))
+	next := s.q("SELECT %s, %s FROM %s WHERE %s > %s ORDER BY %s %s",
+		s.key(), s.value(), s.table, s.key(), s.ph(1), s.key(), s.tx.store.dialect.LimitSuffix(pageSize))
+	var lastKey []byte
+	for {
 		if s.tx.ctx.Err() != nil {
 			return stoabs.DatabaseError(s.tx.ctx.Err())
 		}
-		var k, v []byte
-		if err := rows.Scan(&k, &v); err != nil {
-			return stoabs.DatabaseError(err)
+		var page []row
+		var err error
+		if lastKey == nil {
+			page, err = s.scanPage(first)
+		} else {
+			page, err = s.scanPage(next, lastKey)
 		}
-		key, err := keyType.FromBytes(k)
 		if err != nil {
 			return err
 		}
-		if v == nil {
-			v = []byte{}
+		for _, r := range page {
+			if s.tx.ctx.Err() != nil {
+				return stoabs.DatabaseError(s.tx.ctx.Err())
+			}
+			key, err := keyType.FromBytes(r.key)
+			if err != nil {
+				return err
+			}
+			if err := callback(key, r.value); err != nil {
+				return err
+			}
 		}
-		if err := callback(key, v); err != nil {
-			return err
+		if len(page) < pageSize {
+			return nil
 		}
+		lastKey = page[len(page)-1].key
 	}
-	if err := rows.Err(); err != nil {
-		return stoabs.DatabaseError(err)
-	}
-	return nil
 }
 
 func (s *shelf) Range(from stoabs.Key, to stoabs.Key, callback stoabs.CallerFn, stopAtNil bool) error {
 	if err := s.flush(); err != nil {
 		return err
 	}
-	rows, err := s.tx.tx.QueryContext(s.tx.ctx,
-		s.q("SELECT %s, %s FROM %s WHERE %s >= %s AND %s < %s ORDER BY %s",
-			s.key(), s.value(), s.table, s.key(), s.ph(1), s.key(), s.ph(2), s.key()),
-		from.Bytes(), to.Bytes())
-	if err != nil {
-		return stoabs.DatabaseError(err)
-	}
-	defer rows.Close()
+	// Keyset pagination: the first page starts at from (inclusive), later pages continue strictly after the last key
+	// seen. The continuation must be a strict comparison on the last key itself: SQL Server pads the shorter of two
+	// binary values with zero bytes when comparing, so "lastKey + 0x00" would compare equal to lastKey.
+	first := s.q("SELECT %s, %s FROM %s WHERE %s >= %s AND %s < %s ORDER BY %s %s",
+		s.key(), s.value(), s.table, s.key(), s.ph(1), s.key(), s.ph(2), s.key(), s.tx.store.dialect.LimitSuffix(pageSize))
+	next := s.q("SELECT %s, %s FROM %s WHERE %s > %s AND %s < %s ORDER BY %s %s",
+		s.key(), s.value(), s.table, s.key(), s.ph(1), s.key(), s.ph(2), s.key(), s.tx.store.dialect.LimitSuffix(pageSize))
+	var lastKey []byte
 	var prevKey stoabs.Key
-	for rows.Next() {
+	for {
 		if s.tx.ctx.Err() != nil {
 			return stoabs.DatabaseError(s.tx.ctx.Err())
 		}
-		var k, v []byte
-		if err := rows.Scan(&k, &v); err != nil {
-			return stoabs.DatabaseError(err)
+		var page []row
+		var err error
+		if lastKey == nil {
+			page, err = s.scanPage(first, from.Bytes(), to.Bytes())
+		} else {
+			page, err = s.scanPage(next, lastKey, to.Bytes())
 		}
-		key, err := from.FromBytes(k)
 		if err != nil {
 			return err
 		}
-		if stopAtNil && prevKey != nil && !prevKey.Next().Equals(key) {
-			// gap found, stop here
+		for _, r := range page {
+			if s.tx.ctx.Err() != nil {
+				return stoabs.DatabaseError(s.tx.ctx.Err())
+			}
+			key, err := from.FromBytes(r.key)
+			if err != nil {
+				return err
+			}
+			if stopAtNil && prevKey != nil && !prevKey.Next().Equals(key) {
+				// gap found, stop here
+				return nil
+			}
+			if err := callback(key, r.value); err != nil {
+				return err
+			}
+			prevKey = key
+		}
+		if len(page) < pageSize {
 			return nil
 		}
-		if v == nil {
-			v = []byte{}
-		}
-		if err := callback(key, v); err != nil {
-			return err
-		}
-		prevKey = key
+		lastKey = page[len(page)-1].key
 	}
-	if err := rows.Err(); err != nil {
-		return stoabs.DatabaseError(err)
-	}
-	return nil
 }
 
 // flush writes the buffered puts and deletes of this shelf to the database within the transaction.
