@@ -20,6 +20,7 @@ package kvtests
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"github.com/dgraph-io/badger/v4"
 	"github.com/nuts-foundation/go-stoabs"
@@ -510,6 +511,8 @@ func TestWriteTransactions(t *testing.T, storeProvider StoreProvider) {
 					_ = dbTX.Rollback()
 				case *badger.Txn:
 					dbTX.Discard()
+				case *sql.Tx:
+					_ = dbTX.Rollback()
 				default:
 					// Not supported
 					t.SkipNow()

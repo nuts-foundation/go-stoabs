@@ -37,3 +37,36 @@ Redis locks are implemented using (Redsync)[https://github.com/go-redsync/redsyn
 
 * Clustering
 
+## SQL
+
+The `sql` package implements a `KVStore` on a SQL database through `database/sql`. Supported dialects: SQLite,
+PostgreSQL, MySQL/MariaDB and SQL Server.
+
+Every shelf is a table with a binary `key` column (primary key) and a binary `value` column. The application owns the
+schema: it creates the tables (e.g. with its migration tooling) and passes a function that maps a shelf name to a
+table name. The store never executes DDL; operating on a shelf whose table does not exist returns a `stoabs.ErrDatabase`.
+
+```golang
+db, _ := sql.Open("pgx", dsn)
+store, err := stoabssql.Wrap(db, stoabssql.Postgres(), stoabssql.PrefixTableName("kv_network_data"))
+```
+
+Expected table shape (types differ per database):
+
+```sql
+CREATE TABLE kv_network_data_documents (
+    "key"   BYTEA NOT NULL PRIMARY KEY, -- VARBINARY(128) on MySQL/SQL Server, BLOB on SQLite
+    "value" BYTEA NOT NULL              -- LONGBLOB / VARBINARY(MAX) / BLOB
+);
+```
+
+Keys are ordered bytewise, matching bbolt and the `stoabs.Key` types, so `Range()` and `Iterate()` behave the same.
+
+### Transactions
+
+Writable transactions are serialized per store with a process-level lock, like the bbolt backend. Readers are not
+blocked. Writes are buffered per shelf and flushed as multi-row upserts/deletes before any read that needs them and
+at commit, so reading a value written earlier in the same transaction works.
+
+The database handle passed to `Wrap` is owned by the caller and is not closed by `Close()`.
+
