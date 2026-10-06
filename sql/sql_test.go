@@ -26,6 +26,7 @@ import (
 	"os"
 	"path"
 	"testing"
+	"time"
 
 	"github.com/nuts-foundation/go-stoabs"
 	"github.com/nuts-foundation/go-stoabs/kvtests"
@@ -47,9 +48,9 @@ const tablePrefix = "kv_unit"
 type testDatabase struct {
 	name    string
 	dialect Dialect
-	// open returns a fresh database handle. For SQLite that is a new file per test; for the others, the shared
-	// server from the environment variable.
-	open func(t *testing.T) *sql.DB
+	// open returns a database handle. For SQLite that is the file in the given directory (so two handles on the same
+	// directory share one database); for the others, the shared server from the environment variable.
+	open func(t *testing.T, dir string) *sql.DB
 	// createTable is the DDL template for a shelf table, with %s for the quoted table name.
 	createTable string
 }
@@ -58,8 +59,8 @@ var databases = []testDatabase{
 	{
 		name:    "sqlite",
 		dialect: SQLite(),
-		open: func(t *testing.T) *sql.DB {
-			db, err := sql.Open("sqlite", "file:"+path.Join(t.TempDir(), "test.db")+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+		open: func(t *testing.T, dir string) *sql.DB {
+			db, err := sql.Open("sqlite", "file:"+path.Join(dir, "test.db")+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
 			require.NoError(t, err)
 			return db
 		},
@@ -86,8 +87,8 @@ var databases = []testDatabase{
 }
 
 // envDatabase returns an opener that uses the DSN from the environment variable, or skips the test if unset.
-func envDatabase(driver string, envVar string) func(t *testing.T) *sql.DB {
-	return func(t *testing.T) *sql.DB {
+func envDatabase(driver string, envVar string) func(t *testing.T, dir string) *sql.DB {
+	return func(t *testing.T, _ string) *sql.DB {
 		dsn := os.Getenv(envVar)
 		if dsn == "" {
 			t.Skipf("%s not set, skipping", envVar)
@@ -104,23 +105,132 @@ func envDatabase(driver string, envVar string) func(t *testing.T) *sql.DB {
 func (d testDatabase) provider(t *testing.T) kvtests.StoreProvider {
 	var counter int
 	return func(t *testing.T) (stoabs.KVStore, error) {
-		db := d.open(t)
+		db := d.open(t, t.TempDir())
 		counter++
 		prefix := fmt.Sprintf("%s_%d_%d", tablePrefix, os.Getpid(), counter)
 		tableName := PrefixTableName(prefix)
-		for _, shelf := range testShelves {
-			quoted := d.dialect.QuoteIdentifier(tableName(shelf))
-			_, err := db.ExecContext(context.Background(), fmt.Sprintf(d.createTable, quoted))
-			require.NoError(t, err)
-		}
+		createTables(t, d, db, tableName)
 		t.Cleanup(func() {
-			for _, shelf := range testShelves {
-				quoted := d.dialect.QuoteIdentifier(tableName(shelf))
-				_, _ = db.ExecContext(context.Background(), "DROP TABLE "+quoted)
-			}
+			dropTables(d, db, tableName)
 			_ = db.Close()
 		})
 		return Wrap(db, d.dialect, tableName)
+	}
+}
+
+// createTables creates the shelf tables and the seeded lock table, as the application's schema migration would.
+func createTables(t *testing.T, d testDatabase, db *sql.DB, tableName TableNameFunc) {
+	for _, shelf := range append([]string{LockShelf}, testShelves...) {
+		quoted := d.dialect.QuoteIdentifier(tableName(shelf))
+		_, err := db.ExecContext(context.Background(), fmt.Sprintf(d.createTable, quoted))
+		require.NoError(t, err)
+	}
+	lockTable := d.dialect.QuoteIdentifier(tableName(LockShelf))
+	_, err := db.ExecContext(context.Background(), fmt.Sprintf("INSERT INTO %s (%s, %s) VALUES (%s, %s)",
+		lockTable, d.dialect.QuoteIdentifier(keyColumn), d.dialect.QuoteIdentifier(valueColumn),
+		d.dialect.Placeholder(1), d.dialect.Placeholder(2)), LockKey, []byte{})
+	require.NoError(t, err)
+}
+
+func dropTables(d testDatabase, db *sql.DB, tableName TableNameFunc) {
+	for _, shelf := range append([]string{LockShelf}, testShelves...) {
+		quoted := d.dialect.QuoteIdentifier(tableName(shelf))
+		_, _ = db.ExecContext(context.Background(), "DROP TABLE "+quoted)
+	}
+}
+
+// TestCrossProcessWriteLock simulates two node instances (two stores on two database handles, no shared Go state)
+// writing to the same store: the second writer must wait for the first one's transaction to finish.
+func TestCrossProcessWriteLock(t *testing.T) {
+	ctx := context.Background()
+	for _, d := range databases {
+		t.Run(d.name, func(t *testing.T) {
+			dir := t.TempDir()
+			d.open(t, dir).Close()
+			tableName := PrefixTableName(fmt.Sprintf("%s_xp_%d", tablePrefix, os.Getpid()))
+			db1 := d.open(t, dir)
+			db2 := d.open(t, dir)
+			createTables(t, d, db1, tableName)
+			t.Cleanup(func() {
+				dropTables(d, db1, tableName)
+				_ = db1.Close()
+				_ = db2.Close()
+			})
+			store1, err := Wrap(db1, d.dialect, tableName, stoabs.WithLockAcquireTimeout(10*time.Second))
+			require.NoError(t, err)
+			store2, err := Wrap(db2, d.dialect, tableName, stoabs.WithLockAcquireTimeout(10*time.Second))
+			require.NoError(t, err)
+
+			t.Run("second writer waits for the first", func(t *testing.T) {
+				const hold = 700 * time.Millisecond
+				inFirst := make(chan struct{})
+				var firstCommitted, secondStarted time.Time
+				errs := make(chan error, 2)
+				go func() {
+					errs <- store1.WriteShelf(ctx, "test", func(writer stoabs.Writer) error {
+						close(inFirst)
+						time.Sleep(hold)
+						firstCommitted = time.Now()
+						return writer.Put(stoabs.BytesKey("a"), []byte{1})
+					})
+				}()
+				<-inFirst
+				go func() {
+					errs <- store2.WriteShelf(ctx, "test", func(writer stoabs.Writer) error {
+						secondStarted = time.Now()
+						return writer.Put(stoabs.BytesKey("b"), []byte{2})
+					})
+				}()
+				require.NoError(t, <-errs)
+				require.NoError(t, <-errs)
+				assert.False(t, secondStarted.Before(firstCommitted), "second writer ran while first held the lock")
+			})
+			t.Run("timeout while another writer holds the lock", func(t *testing.T) {
+				impatient, err := Wrap(db2, d.dialect, tableName, stoabs.WithLockAcquireTimeout(300*time.Millisecond))
+				require.NoError(t, err)
+				inFirst := make(chan struct{})
+				release := make(chan struct{})
+				go func() {
+					_ = store1.WriteShelf(ctx, "test", func(writer stoabs.Writer) error {
+						close(inFirst)
+						<-release
+						return nil
+					})
+				}()
+				<-inFirst
+				err = impatient.WriteShelf(ctx, "test", func(writer stoabs.Writer) error { return nil })
+				close(release)
+				assert.ErrorIs(t, err, stoabs.ErrDatabase{})
+				assert.ErrorContains(t, err, "unable to obtain SQL write lock")
+			})
+			t.Run("readers are not blocked by a writer", func(t *testing.T) {
+				inFirst := make(chan struct{})
+				release := make(chan struct{})
+				go func() {
+					_ = store1.WriteShelf(ctx, "test", func(writer stoabs.Writer) error {
+						close(inFirst)
+						<-release
+						return nil
+					})
+				}()
+				<-inFirst
+				readCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				defer cancel()
+				err := store2.ReadShelf(readCtx, "test", func(reader stoabs.Reader) error {
+					_, err := reader.Get(stoabs.BytesKey("a"))
+					return err
+				})
+				close(release)
+				assert.NoError(t, err)
+			})
+			t.Run("missing lock row fails loud", func(t *testing.T) {
+				_, err := db1.ExecContext(ctx, "DELETE FROM "+d.dialect.QuoteIdentifier(tableName(LockShelf)))
+				require.NoError(t, err)
+				err = store1.WriteShelf(ctx, "test", func(writer stoabs.Writer) error { return nil })
+				assert.ErrorIs(t, err, ErrLockRowMissing)
+				assert.ErrorIs(t, err, stoabs.ErrDatabase{})
+			})
+		})
 	}
 }
 
@@ -128,7 +238,7 @@ func TestConformance(t *testing.T) {
 	for _, d := range databases {
 		t.Run(d.name, func(t *testing.T) {
 			// Skip the whole database early if it is not configured.
-			d.open(t).Close()
+			d.open(t, t.TempDir()).Close()
 			provider := d.provider(t)
 			kvtests.TestReadingAndWriting(t, provider)
 			kvtests.TestRange(t, provider)
@@ -150,7 +260,7 @@ func TestNestedReads(t *testing.T) {
 	ctx := context.Background()
 	for _, d := range databases {
 		t.Run(d.name, func(t *testing.T) {
-			d.open(t).Close()
+			d.open(t, t.TempDir()).Close()
 			store, err := d.provider(t)(t)
 			require.NoError(t, err)
 			const n = pageSize + 5
@@ -307,7 +417,7 @@ func TestSQLite_Specifics(t *testing.T) {
 		assert.ErrorIs(t, err, stoabs.ErrDatabase{})
 	})
 	t.Run("invalid table name", func(t *testing.T) {
-		db := databases[0].open(t)
+		db := databases[0].open(t, t.TempDir())
 		t.Cleanup(func() { _ = db.Close() })
 		store, err := Wrap(db, SQLite(), func(shelf string) string { return "bad;name" })
 		require.NoError(t, err)
@@ -352,7 +462,7 @@ func TestSQLite_Specifics(t *testing.T) {
 }
 
 func TestWrap_Validation(t *testing.T) {
-	db := databases[0].open(t)
+	db := databases[0].open(t, t.TempDir())
 	t.Cleanup(func() { _ = db.Close() })
 	_, err := Wrap(nil, SQLite(), PrefixTableName("x"))
 	assert.EqualError(t, err, "sql: db is nil")

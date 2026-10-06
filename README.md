@@ -64,9 +64,22 @@ Keys are ordered bytewise, matching bbolt and the `stoabs.Key` types, so `Range(
 
 ### Transactions
 
-Writable transactions are serialized per store with a process-level lock, like the bbolt backend. Readers are not
-blocked. Writes are buffered per shelf and flushed as multi-row upserts/deletes before any read that needs them and
-at commit, so reading a value written earlier in the same transaction works.
+Writable transactions are serialized per store, across processes: every writable transaction first takes an exclusive,
+transaction-scoped lock on the single row of the store's lock table (the pseudo-shelf `stoabssql.LockShelf`, `_lock`,
+with key `stoabssql.LockKey`). `SELECT ... FOR UPDATE` on PostgreSQL and MySQL, `UPDLOCK, HOLDLOCK` on SQL Server, an
+eager no-op `UPDATE` on SQLite. This is the equivalent of bbolt's exclusive file lock, but it also covers multiple
+instances of the application on one database. The application creates and seeds the lock table with its other tables;
+a missing lock row fails the transaction with `ErrLockRowMissing` rather than silently not locking. Readers never touch
+the lock row and are not blocked.
+
+```sql
+CREATE TABLE kv_network_data__lock ("key" BYTEA NOT NULL PRIMARY KEY, "value" BYTEA NOT NULL);
+INSERT INTO kv_network_data__lock ("key", "value") VALUES ('\x00', '');
+```
+
+Writes are buffered per shelf and flushed as multi-row upserts/deletes before any read that needs them and at commit,
+so reading a value written earlier in the same transaction works. `Iterate` and `Range` read in pages and invoke the
+callbacks between pages, so a callback may run further queries on the same transaction.
 
 The database handle passed to `Wrap` is owned by the caller and is not closed by `Close()`.
 

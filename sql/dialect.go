@@ -19,7 +19,9 @@
 package sql
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -42,10 +44,28 @@ type Dialect interface {
 	ByteLength(column string) string
 	// LimitSuffix returns the clause, appended after ORDER BY, that limits a query to the given number of rows.
 	LimitSuffix(rows int) string
+	// LockRow takes an exclusive, transaction-scoped lock on the row with the given key in the given (quoted) lock
+	// table, blocking until it is available or ctx expires. It returns ErrLockRowMissing when the row does not exist,
+	// because then no lock was taken.
+	LockRow(ctx context.Context, tx *sql.Tx, table string, key []byte) error
 	// ReadTxOptions returns the options for read-only transactions, or nil for the database default.
 	ReadTxOptions() *sql.TxOptions
 	// WriteTxOptions returns the options for writable transactions, or nil for the database default.
 	WriteTxOptions() *sql.TxOptions
+}
+
+// ErrLockRowMissing is returned when the lock table has no row for the lock key, so no write lock could be taken.
+// The application creates and seeds the lock table together with the shelf tables.
+var ErrLockRowMissing = errors.New("lock row is missing from the lock table")
+
+// lockRowBySelect takes the lock with a locking SELECT and verifies a row was returned.
+func lockRowBySelect(ctx context.Context, tx *sql.Tx, query string, key []byte) error {
+	var k []byte
+	err := tx.QueryRowContext(ctx, query, key).Scan(&k)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrLockRowMissing
+	}
+	return err
 }
 
 // Column names used in the shelf tables. The application creates the tables, see the package documentation.
@@ -96,8 +116,25 @@ func (d sqliteDialect) Upsert(table string, rows int) string {
 }
 func (sqliteDialect) ByteLength(column string) string { return "length(" + column + ")" }
 func (sqliteDialect) LimitSuffix(rows int) string     { return "LIMIT " + strconv.Itoa(rows) }
-func (sqliteDialect) ReadTxOptions() *sql.TxOptions   { return nil }
-func (sqliteDialect) WriteTxOptions() *sql.TxOptions  { return nil }
+func (d sqliteDialect) LockRow(ctx context.Context, tx *sql.Tx, table string, key []byte) error {
+	// SQLite has no FOR UPDATE. A no-op UPDATE takes the database write lock eagerly (instead of at the first real
+	// write), which is as exclusive as SQLite gets: one writer per database.
+	result, err := tx.ExecContext(ctx, fmt.Sprintf("UPDATE %s SET %s = %s WHERE %s = ?",
+		table, d.QuoteIdentifier(valueColumn), d.QuoteIdentifier(valueColumn), d.QuoteIdentifier(keyColumn)), key)
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrLockRowMissing
+	}
+	return nil
+}
+func (sqliteDialect) ReadTxOptions() *sql.TxOptions  { return nil }
+func (sqliteDialect) WriteTxOptions() *sql.TxOptions { return nil }
 
 type postgresDialect struct{}
 
@@ -111,6 +148,10 @@ func (d postgresDialect) Upsert(table string, rows int) string {
 }
 func (postgresDialect) ByteLength(column string) string { return "length(" + column + ")" }
 func (postgresDialect) LimitSuffix(rows int) string     { return "LIMIT " + strconv.Itoa(rows) }
+func (d postgresDialect) LockRow(ctx context.Context, tx *sql.Tx, table string, key []byte) error {
+	return lockRowBySelect(ctx, tx, fmt.Sprintf("SELECT %s FROM %s WHERE %s = $1 FOR UPDATE",
+		d.QuoteIdentifier(keyColumn), table, d.QuoteIdentifier(keyColumn)), key)
+}
 func (postgresDialect) ReadTxOptions() *sql.TxOptions {
 	// Snapshot semantics for reads, like a bbolt read transaction.
 	return &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true}
@@ -131,6 +172,10 @@ func (d mysqlDialect) Upsert(table string, rows int) string {
 }
 func (mysqlDialect) ByteLength(column string) string { return "LENGTH(" + column + ")" }
 func (mysqlDialect) LimitSuffix(rows int) string     { return "LIMIT " + strconv.Itoa(rows) }
+func (d mysqlDialect) LockRow(ctx context.Context, tx *sql.Tx, table string, key []byte) error {
+	return lockRowBySelect(ctx, tx, fmt.Sprintf("SELECT %s FROM %s WHERE %s = ? FOR UPDATE",
+		d.QuoteIdentifier(keyColumn), table, d.QuoteIdentifier(keyColumn)), key)
+}
 func (mysqlDialect) ReadTxOptions() *sql.TxOptions {
 	// InnoDB's default is REPEATABLE READ, which gives a consistent snapshot per transaction.
 	return &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true}
@@ -154,6 +199,11 @@ func (d sqlServerDialect) Upsert(table string, rows int) string {
 func (sqlServerDialect) ByteLength(column string) string { return "DATALENGTH(" + column + ")" }
 func (sqlServerDialect) LimitSuffix(rows int) string {
 	return "OFFSET 0 ROWS FETCH NEXT " + strconv.Itoa(rows) + " ROWS ONLY"
+}
+func (d sqlServerDialect) LockRow(ctx context.Context, tx *sql.Tx, table string, key []byte) error {
+	// UPDLOCK makes the lock exclusive among writers, HOLDLOCK keeps it until the transaction ends.
+	return lockRowBySelect(ctx, tx, fmt.Sprintf("SELECT %s FROM %s WITH (UPDLOCK, HOLDLOCK) WHERE %s = @p1",
+		d.QuoteIdentifier(keyColumn), table, d.QuoteIdentifier(keyColumn)), key)
 }
 func (sqlServerDialect) ReadTxOptions() *sql.TxOptions {
 	// SNAPSHOT isolation requires ALLOW_SNAPSHOT_ISOLATION on the database, so stick to the default.

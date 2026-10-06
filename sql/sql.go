@@ -59,6 +59,15 @@ var _ stoabs.WriteTx = (*tx)(nil)
 var _ stoabs.Reader = (*shelf)(nil)
 var _ stoabs.Writer = (*shelf)(nil)
 
+// LockShelf is the name of the pseudo-shelf whose table holds the per-store write lock row. The application creates
+// this table like any other shelf table (through its TableNameFunc) and seeds it with one row with LockKey as key.
+// Every writable transaction locks that row first, so writers of all processes on the same database are serialized,
+// like bbolt's exclusive file lock serializes writers of one process. Readers never touch it.
+const LockShelf = "_lock"
+
+// LockKey is the key of the single row in the lock table.
+var LockKey = []byte{0}
+
 // batchSize is the maximum number of rows per upsert/delete statement.
 // 2 parameters per row keeps it under SQL Server's limit of 2100 parameters per statement.
 const batchSize = 500
@@ -181,6 +190,14 @@ func (s *store) doTX(ctx context.Context, fn func(t *tx) error, writable bool, o
 		unlock()
 		return stoabs.DatabaseError(err)
 	}
+	if writable {
+		// Database-level write lock, so that writers in other processes (other node instances) are excluded too.
+		if err := s.lockForWrite(ctx, dbTX); err != nil {
+			s.rollback(dbTX)
+			unlock()
+			return fmt.Errorf("unable to obtain SQL write lock: %w", err)
+		}
+	}
 	t := &tx{store: s, tx: dbTX, ctx: ctx, writable: writable, shelves: map[string]*shelf{}}
 
 	appError := fn(t)
@@ -214,6 +231,24 @@ func (s *store) doTX(ctx context.Context, fn func(t *tx) error, writable bool, o
 	}
 	unlock()
 	stoabs.AfterCommitOption{}.Invoke(opts)
+	return nil
+}
+
+// lockForWrite locks the store's lock row within the transaction, waiting at most the configured lock acquire timeout.
+func (s *store) lockForWrite(ctx context.Context, dbTX *sql.Tx) error {
+	table, err := s.table(LockShelf)
+	if err != nil {
+		return stoabs.DatabaseError(err)
+	}
+	lockCtx, cancel := context.WithTimeout(ctx, s.cfg.LockAcquireTimeout)
+	defer cancel()
+	if err := s.dialect.LockRow(lockCtx, dbTX, table, LockKey); err != nil {
+		if lockCtx.Err() != nil && ctx.Err() == nil {
+			// Timed out waiting for another writer, not cancelled by the caller
+			return stoabs.DatabaseError(fmt.Errorf("timeout waiting for write lock: %w", err))
+		}
+		return stoabs.DatabaseError(err)
+	}
 	return nil
 }
 
