@@ -433,38 +433,50 @@ func (s *shelf) Stats() stoabs.ShelfStats {
 	return stoabs.ShelfStats{NumEntries: numEntries, ShelfSize: size}
 }
 
-// pageSize is the number of rows fetched per query by Iterate and Range.
+// pageSize is the maximum number of rows fetched per query by Iterate and Range, pageBytes the maximum total size of
+// keys and values held in memory per page. A page ends at whichever limit is reached first, so memory stays bounded
+// by roughly pageBytes plus one row even for shelves with large values (payloads, IBLT pages).
 const pageSize = 1000
+
+var pageBytes = 4 * 1024 * 1024
 
 type row struct {
 	key   []byte
 	value []byte
 }
 
-// scanPage runs a query that returns (key, value) rows and reads them all, closing the result set before returning.
+// scanPage runs a query that returns (key, value) rows ordered by key and reads up to pageSize rows or pageBytes
+// bytes, closing the result set before returning. It reports whether the page was cut short by the byte limit, in
+// which case the caller continues after the page's last key.
 // Callbacks must never run while a result set is open: a nested query on the same transaction (e.g. a Get from
 // inside an Iterate callback) fails on Postgres, MySQL and SQL Server while rows are pending on the connection.
-func (s *shelf) scanPage(query string, args ...interface{}) ([]row, error) {
+func (s *shelf) scanPage(query string, args ...interface{}) (page []row, truncated bool, err error) {
 	rows, err := s.tx.tx.QueryContext(s.tx.ctx, query, args...)
 	if err != nil {
-		return nil, stoabs.DatabaseError(err)
+		return nil, false, stoabs.DatabaseError(err)
 	}
 	defer rows.Close()
-	page := make([]row, 0, pageSize)
+	page = make([]row, 0, pageSize)
+	size := 0
 	for rows.Next() {
 		var r row
 		if err := rows.Scan(&r.key, &r.value); err != nil {
-			return nil, stoabs.DatabaseError(err)
+			return nil, false, stoabs.DatabaseError(err)
 		}
 		if r.value == nil {
 			r.value = []byte{}
 		}
 		page = append(page, r)
+		size += len(r.key) + len(r.value)
+		if size >= pageBytes {
+			// Stop reading; rows.Close discards the remainder of this result set.
+			return page, true, nil
+		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, stoabs.DatabaseError(err)
+		return nil, false, stoabs.DatabaseError(err)
 	}
-	return page, nil
+	return page, false, nil
 }
 
 func (s *shelf) Iterate(callback stoabs.CallerFn, keyType stoabs.Key) error {
@@ -482,11 +494,12 @@ func (s *shelf) Iterate(callback stoabs.CallerFn, keyType stoabs.Key) error {
 			return stoabs.DatabaseError(s.tx.ctx.Err())
 		}
 		var page []row
+		var truncated bool
 		var err error
 		if lastKey == nil {
-			page, err = s.scanPage(first)
+			page, truncated, err = s.scanPage(first)
 		} else {
-			page, err = s.scanPage(next, lastKey)
+			page, truncated, err = s.scanPage(next, lastKey)
 		}
 		if err != nil {
 			return err
@@ -503,7 +516,7 @@ func (s *shelf) Iterate(callback stoabs.CallerFn, keyType stoabs.Key) error {
 				return err
 			}
 		}
-		if len(page) < pageSize {
+		if !truncated && len(page) < pageSize {
 			return nil
 		}
 		lastKey = page[len(page)-1].key
@@ -528,11 +541,12 @@ func (s *shelf) Range(from stoabs.Key, to stoabs.Key, callback stoabs.CallerFn, 
 			return stoabs.DatabaseError(s.tx.ctx.Err())
 		}
 		var page []row
+		var truncated bool
 		var err error
 		if lastKey == nil {
-			page, err = s.scanPage(first, from.Bytes(), to.Bytes())
+			page, truncated, err = s.scanPage(first, from.Bytes(), to.Bytes())
 		} else {
-			page, err = s.scanPage(next, lastKey, to.Bytes())
+			page, truncated, err = s.scanPage(next, lastKey, to.Bytes())
 		}
 		if err != nil {
 			return err
@@ -554,7 +568,7 @@ func (s *shelf) Range(from stoabs.Key, to stoabs.Key, callback stoabs.CallerFn, 
 			}
 			prevKey = key
 		}
-		if len(page) < pageSize {
+		if !truncated && len(page) < pageSize {
 			return nil
 		}
 		lastKey = page[len(page)-1].key

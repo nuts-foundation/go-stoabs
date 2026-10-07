@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -103,12 +104,13 @@ func envDatabase(driver string, envVar string) func(t *testing.T, dir string) *s
 
 // provider returns a kvtests.StoreProvider for the database. Each store gets its own table prefix so tests
 // running against a shared server do not see each other's data, and the tables are dropped afterwards.
+// storeCounter makes table prefixes unique across all providers in the process (several tests share one server).
+var storeCounter atomic.Int64
+
 func (d testDatabase) provider(t *testing.T) kvtests.StoreProvider {
-	var counter int
 	return func(t *testing.T) (stoabs.KVStore, error) {
 		db := d.open(t, t.TempDir())
-		counter++
-		prefix := fmt.Sprintf("%s_%d_%d", tablePrefix, os.Getpid(), counter)
+		prefix := fmt.Sprintf("%s_%d_%d", tablePrefix, os.Getpid(), storeCounter.Add(1))
 		tableName := PrefixTableName(prefix)
 		createTables(t, d, db, tableName)
 		t.Cleanup(func() {
@@ -314,6 +316,43 @@ func TestNestedReads(t *testing.T) {
 				for i := 1; i < len(keys); i++ {
 					assert.Equal(t, keys[i-1]+1, keys[i])
 				}
+			})
+			t.Run("pages are cut by size, iteration stays complete and ordered", func(t *testing.T) {
+				previous := pageBytes
+				pageBytes = 64 * 1024 // 64 KB: with 10 KB values a page holds 7 rows
+				t.Cleanup(func() { pageBytes = previous })
+				large, err := d.provider(t)(t)
+				require.NoError(t, err)
+				const rows = 100
+				value := bytes.Repeat([]byte{1}, 10*1024)
+				require.NoError(t, large.WriteShelf(ctx, "test", func(w stoabs.Writer) error {
+					for i := 0; i < rows; i++ {
+						require.NoError(t, w.Put(stoabs.Uint32Key(i), value))
+					}
+					return nil
+				}))
+				var seen []stoabs.Uint32Key
+				require.NoError(t, large.ReadShelf(ctx, "test", func(r stoabs.Reader) error {
+					return r.Iterate(func(key stoabs.Key, v []byte) error {
+						assert.Len(t, v, len(value))
+						// nested query on the same tx must still work between pages
+						_, err := r.Get(key)
+						seen = append(seen, key.(stoabs.Uint32Key))
+						return err
+					}, stoabs.Uint32Key(0))
+				}))
+				require.Len(t, seen, rows)
+				for i := range seen {
+					assert.Equal(t, stoabs.Uint32Key(i), seen[i])
+				}
+				var ranged int
+				require.NoError(t, large.ReadShelf(ctx, "test", func(r stoabs.Reader) error {
+					return r.Range(stoabs.Uint32Key(10), stoabs.Uint32Key(90), func(_ stoabs.Key, _ []byte) error {
+						ranged++
+						return nil
+					}, true)
+				}))
+				assert.Equal(t, 80, ranged)
 			})
 			t.Run("Iterate inside a write transaction sees buffered writes", func(t *testing.T) {
 				err := store.Write(ctx, func(tx stoabs.WriteTx) error {
