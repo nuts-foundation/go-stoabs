@@ -40,7 +40,8 @@ Redis locks are implemented using (Redsync)[https://github.com/go-redsync/redsyn
 ## SQL
 
 The `sql` package implements a `KVStore` on a SQL database through `database/sql`. Supported dialects: SQLite,
-PostgreSQL, MySQL/MariaDB and SQL Server.
+PostgreSQL, MySQL/MariaDB and SQL Server (`SQLServer()` also covers Azure SQL, which speaks the same T-SQL over the
+same driver; it is verified against SQL Server 2022 in CI, not against Azure SQL itself).
 
 Every shelf is a table with a binary `key` column (primary key) and a binary `value` column. The application owns the
 schema: it creates the tables (e.g. with its migration tooling) and passes a function that maps a shelf name to a
