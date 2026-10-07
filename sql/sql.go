@@ -32,9 +32,17 @@
 //
 // Keys are compared and ordered bytewise, which matches the ordering of bbolt and of the stoabs.Key types.
 //
-// Writable transactions are serialized per store with a process-level lock, like the bbolt backend.
+// Writable transactions are serialized per store, across processes: every writable transaction first locks the
+// single row of the store's lock table (see LockShelf), which the application creates and seeds like the shelf
+// tables. This is the equivalent of bbolt's exclusive file lock. Readers never touch the lock row.
 // Writes are buffered per shelf and flushed as multi-row upserts/deletes before any read that needs them
 // and at commit, to keep the number of round trips low.
+//
+// Database notes:
+//   - SQLite: the write lock is taken with an eager no-op UPDATE; set busy_timeout in the DSN so a second writer
+//     waits instead of failing with "database is locked".
+//   - SQL Server: readers run at the database's default isolation. Without READ_COMMITTED_SNAPSHOT a reader can
+//     briefly wait for a committing writer's row locks; it never waits for the lock row.
 package sql
 
 import (
@@ -71,6 +79,11 @@ var LockKey = []byte{0}
 // batchSize is the maximum number of rows per upsert/delete statement.
 // 2 parameters per row keeps it under SQL Server's limit of 2100 parameters per statement.
 const batchSize = 500
+
+// batchBytes is the maximum total size of keys and values per upsert statement. Keeps a statement well under
+// packet/parameter size limits (MariaDB's default max_allowed_packet is 16 MB) when values are large.
+// A single row larger than this is still sent, on its own.
+const batchBytes = 4 * 1024 * 1024
 
 var identifierPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
@@ -575,11 +588,22 @@ func (s *shelf) flush() error {
 			return err
 		}
 	}
-	for start := 0; start < len(puts); start += 2 * batchSize {
-		end := min(start+2*batchSize, len(puts))
+	// puts are key, value pairs; cut into statements of at most batchSize rows and batchBytes bytes
+	start := 0
+	for start < len(puts) {
+		end, size := start, 0
+		for end < len(puts) && (end-start)/2 < batchSize {
+			rowSize := len(puts[end]) + len(puts[end+1])
+			if end > start && size+rowSize > batchBytes {
+				break
+			}
+			size += rowSize
+			end += 2
+		}
 		if err := s.upsertBatch(puts[start:end]); err != nil {
 			return err
 		}
+		start = end
 	}
 	return nil
 }

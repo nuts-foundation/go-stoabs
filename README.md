@@ -77,9 +77,19 @@ CREATE TABLE kv_network_data__lock ("key" BYTEA NOT NULL PRIMARY KEY, "value" BY
 INSERT INTO kv_network_data__lock ("key", "value") VALUES ('\x00', '');
 ```
 
-Writes are buffered per shelf and flushed as multi-row upserts/deletes before any read that needs them and at commit,
-so reading a value written earlier in the same transaction works. `Iterate` and `Range` read in pages and invoke the
-callbacks between pages, so a callback may run further queries on the same transaction.
+Writes are buffered per shelf and flushed as multi-row upserts/deletes (at most 500 rows and 4 MB per statement)
+before any read that needs them and at commit, so reading a value written earlier in the same transaction works.
+`Iterate` and `Range` read in pages and invoke the callbacks between pages, so a callback may run further queries on
+the same transaction.
+
+### Database notes
+
+- SQLite: the write lock is an eager no-op `UPDATE` on the lock row. Set `busy_timeout` in the DSN so a second writer
+  waits instead of failing with "database is locked".
+- SQL Server: readers run at the database's default isolation. Without `READ_COMMITTED_SNAPSHOT` a reader can briefly
+  wait for a committing writer's row locks; it never waits for the lock row.
+- Table names from `PrefixTableName` are lower-cased with non-alphanumerics replaced by `_`, so two shelf names that
+  differ only in case or punctuation map to the same table. Use distinct names.
 
 The database handle passed to `Wrap` is owned by the caller and is not closed by `Close()`.
 

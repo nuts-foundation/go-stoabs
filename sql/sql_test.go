@@ -19,6 +19,7 @@
 package sql
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -403,6 +404,27 @@ func TestSQLite_Specifics(t *testing.T) {
 			return nil
 		}))
 		assert.Equal(t, n-(batchSize+3+1)/2, count)
+	})
+	t.Run("large values are split over statements by size", func(t *testing.T) {
+		store := newStore(t)
+		// 12 values of 1 MB: batchBytes (4 MB) allows 4 per statement, so 3 statements; all must land.
+		const n = 12
+		value := bytes.Repeat([]byte{7}, 1024*1024)
+		require.NoError(t, store.WriteShelf(ctx, "test", func(writer stoabs.Writer) error {
+			for i := 0; i < n; i++ {
+				require.NoError(t, writer.Put(stoabs.Uint32Key(i), value))
+			}
+			return nil
+		}))
+		var count int
+		var size uint
+		require.NoError(t, store.ReadShelf(ctx, "test", func(reader stoabs.Reader) error {
+			stats := reader.Stats()
+			count, size = int(stats.NumEntries), stats.ShelfSize
+			return nil
+		}))
+		assert.Equal(t, n, count)
+		assert.Equal(t, uint(n*len(value)), size)
 	})
 	t.Run("unknown shelf (table missing) fails loud", func(t *testing.T) {
 		store := newStore(t)
