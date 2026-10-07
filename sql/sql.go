@@ -16,7 +16,10 @@
  *
  */
 
-// Package sql implements a stoabs.KVStore on a SQL database (SQLite, PostgreSQL, MySQL/MariaDB, SQL Server).
+// Package sql implements a stoabs.KVStore on a SQL database server (PostgreSQL, MySQL/MariaDB, SQL Server).
+//
+// SQLite is deliberately not supported: it is a file on disk like bbolt, so it shares bbolt's single-instance and
+// network-volume limitations without adding anything over it.
 //
 // Every shelf is a table with two columns, "key" (binary, primary key) and "value" (binary blob).
 // The application owns the schema: it creates the tables (e.g. through its migration tooling) and tells the
@@ -26,8 +29,8 @@
 // Expected table shape (types differ per database):
 //
 //	CREATE TABLE <table> (
-//	    "key"   VARBINARY(128) NOT NULL PRIMARY KEY,
-//	    "value" BLOB           NOT NULL
+//	    "key"   VARBINARY(128) NOT NULL PRIMARY KEY, -- BYTEA on PostgreSQL
+//	    "value" LONGBLOB       NOT NULL              -- BYTEA / VARBINARY(MAX)
 //	);
 //
 // Keys are compared and ordered bytewise, which matches the ordering of bbolt and of the stoabs.Key types.
@@ -39,8 +42,6 @@
 // and at commit, to keep the number of round trips low.
 //
 // Database notes:
-//   - SQLite: the write lock is taken with an eager no-op UPDATE; set busy_timeout in the DSN so a second writer
-//     waits instead of failing with "database is locked".
 //   - SQL Server: readers run at the database's default isolation. Without READ_COMMITTED_SNAPSHOT a reader can
 //     briefly wait for a committing writer's row locks; it never waits for the lock row.
 package sql

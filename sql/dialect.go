@@ -72,9 +72,6 @@ const (
 	valueColumn = "value"
 )
 
-// SQLite returns the dialect for SQLite.
-func SQLite() Dialect { return sqliteDialect{} }
-
 // Postgres returns the dialect for PostgreSQL.
 func Postgres() Dialect { return postgresDialect{} }
 

@@ -25,7 +25,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -38,10 +37,10 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "github.com/microsoft/go-mssqldb"
-	_ "modernc.org/sqlite"
 )
 
 // shelves used by the kvtests conformance suite; the application owns the schema, so the tests create them.
+// All tests need a database server: set STOABS_TEST_{POSTGRES,MYSQL,SQLSERVER}_DSN (see README), unset ones are skipped.
 var testShelves = []string{"test", "other"}
 
 const tablePrefix = "kv_unit"
@@ -50,24 +49,13 @@ const tablePrefix = "kv_unit"
 type testDatabase struct {
 	name    string
 	dialect Dialect
-	// open returns a database handle. For SQLite that is the file in the given directory (so two handles on the same
-	// directory share one database); for the others, the shared server from the environment variable.
-	open func(t *testing.T, dir string) *sql.DB
+	// open returns a database handle to the server from the environment variable, or skips the test if it is unset.
+	open func(t *testing.T) *sql.DB
 	// createTable is the DDL template for a shelf table, with %s for the quoted table name.
 	createTable string
 }
 
 var databases = []testDatabase{
-	{
-		name:    "sqlite",
-		dialect: SQLite(),
-		open: func(t *testing.T, dir string) *sql.DB {
-			db, err := sql.Open("sqlite", "file:"+path.Join(dir, "test.db")+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
-			require.NoError(t, err)
-			return db
-		},
-		createTable: `CREATE TABLE IF NOT EXISTS %s ("key" BLOB NOT NULL PRIMARY KEY, "value" BLOB NOT NULL)`,
-	},
 	{
 		name:        "postgres",
 		dialect:     Postgres(),
@@ -89,8 +77,8 @@ var databases = []testDatabase{
 }
 
 // envDatabase returns an opener that uses the DSN from the environment variable, or skips the test if unset.
-func envDatabase(driver string, envVar string) func(t *testing.T, dir string) *sql.DB {
-	return func(t *testing.T, _ string) *sql.DB {
+func envDatabase(driver string, envVar string) func(t *testing.T) *sql.DB {
+	return func(t *testing.T) *sql.DB {
 		dsn := os.Getenv(envVar)
 		if dsn == "" {
 			t.Skipf("%s not set, skipping", envVar)
@@ -109,7 +97,7 @@ var storeCounter atomic.Int64
 
 func (d testDatabase) provider(t *testing.T) kvtests.StoreProvider {
 	return func(t *testing.T) (stoabs.KVStore, error) {
-		db := d.open(t, t.TempDir())
+		db := d.open(t)
 		prefix := fmt.Sprintf("%s_%d_%d", tablePrefix, os.Getpid(), storeCounter.Add(1))
 		tableName := PrefixTableName(prefix)
 		createTables(t, d, db, tableName)
@@ -148,11 +136,10 @@ func TestCrossProcessWriteLock(t *testing.T) {
 	ctx := context.Background()
 	for _, d := range databases {
 		t.Run(d.name, func(t *testing.T) {
-			dir := t.TempDir()
-			d.open(t, dir).Close()
-			tableName := PrefixTableName(fmt.Sprintf("%s_xp_%d", tablePrefix, os.Getpid()))
-			db1 := d.open(t, dir)
-			db2 := d.open(t, dir)
+			d.open(t).Close()
+			tableName := PrefixTableName(fmt.Sprintf("%s_xp_%d_%d", tablePrefix, os.Getpid(), storeCounter.Add(1)))
+			db1 := d.open(t)
+			db2 := d.open(t)
 			createTables(t, d, db1, tableName)
 			t.Cleanup(func() {
 				dropTables(d, db1, tableName)
@@ -241,7 +228,7 @@ func TestConformance(t *testing.T) {
 	for _, d := range databases {
 		t.Run(d.name, func(t *testing.T) {
 			// Skip the whole database early if it is not configured.
-			d.open(t, t.TempDir()).Close()
+			d.open(t).Close()
 			provider := d.provider(t)
 			kvtests.TestReadingAndWriting(t, provider)
 			kvtests.TestRange(t, provider)
@@ -258,12 +245,12 @@ func TestConformance(t *testing.T) {
 
 // TestNestedReads covers what the Nuts node does and the generic conformance suite does not: callbacks of Iterate
 // and Range that query the same transaction again (nested Get), and iterating shelves larger than one page.
-// A streaming implementation fails this on Postgres, MySQL and SQL Server ("bad connection"/"commands out of sync").
+// A streaming implementation fails this on all three databases ("bad connection"/"commands out of sync").
 func TestNestedReads(t *testing.T) {
 	ctx := context.Background()
 	for _, d := range databases {
 		t.Run(d.name, func(t *testing.T) {
-			d.open(t, t.TempDir()).Close()
+			d.open(t).Close()
 			store, err := d.provider(t)(t)
 			require.NoError(t, err)
 			const n = pageSize + 5
@@ -374,10 +361,19 @@ func TestNestedReads(t *testing.T) {
 	}
 }
 
-func TestSQLite_Specifics(t *testing.T) {
+func TestStoreSpecifics(t *testing.T) {
+	for _, d := range databases {
+		t.Run(d.name, func(t *testing.T) {
+			d.open(t).Close()
+			testStoreSpecifics(t, d)
+		})
+	}
+}
+
+func testStoreSpecifics(t *testing.T, d testDatabase) {
 	ctx := context.Background()
 	newStore := func(t *testing.T) stoabs.KVStore {
-		store, err := databases[0].provider(t)(t)
+		store, err := d.provider(t)(t)
 		require.NoError(t, err)
 		return store
 	}
@@ -478,9 +474,9 @@ func TestSQLite_Specifics(t *testing.T) {
 		assert.ErrorIs(t, err, stoabs.ErrDatabase{})
 	})
 	t.Run("invalid table name", func(t *testing.T) {
-		db := databases[0].open(t, t.TempDir())
+		db := d.open(t)
 		t.Cleanup(func() { _ = db.Close() })
-		store, err := Wrap(db, SQLite(), func(shelf string) string { return "bad;name" })
+		store, err := Wrap(db, d.dialect, func(shelf string) string { return "bad;name" })
 		require.NoError(t, err)
 		err = store.ReadShelf(ctx, "test", func(reader stoabs.Reader) error {
 			_, err := reader.Get(stoabs.BytesKey("k"))
@@ -523,13 +519,15 @@ func TestSQLite_Specifics(t *testing.T) {
 }
 
 func TestWrap_Validation(t *testing.T) {
-	db := databases[0].open(t, t.TempDir())
+	// sql.Open does not connect, so no server is needed here
+	db, err := sql.Open("pgx", "postgres://127.0.0.1:1/none")
+	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
-	_, err := Wrap(nil, SQLite(), PrefixTableName("x"))
+	_, err = Wrap(nil, Postgres(), PrefixTableName("x"))
 	assert.EqualError(t, err, "sql: db is nil")
 	_, err = Wrap(db, nil, PrefixTableName("x"))
 	assert.EqualError(t, err, "sql: dialect is nil")
-	_, err = Wrap(db, SQLite(), nil)
+	_, err = Wrap(db, Postgres(), nil)
 	assert.EqualError(t, err, "sql: tableName is nil")
 }
 
@@ -543,9 +541,6 @@ func TestPrefixTableName(t *testing.T) {
 
 func TestDialects_Upsert(t *testing.T) {
 	// Only shape checks; execution is covered by the conformance tests per database.
-	assert.Equal(t,
-		`INSERT INTO "t" ("key", "value") VALUES (?, ?), (?, ?) ON CONFLICT("key") DO UPDATE SET "value" = excluded."value"`,
-		SQLite().Upsert(`"t"`, 2))
 	assert.Equal(t,
 		`INSERT INTO "t" ("key", "value") VALUES ($1, $2) ON CONFLICT ("key") DO UPDATE SET "value" = EXCLUDED."value"`,
 		Postgres().Upsert(`"t"`, 1))
