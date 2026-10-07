@@ -49,6 +49,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"regexp"
@@ -267,7 +268,9 @@ func (s *store) lockForWrite(ctx context.Context, dbTX *sql.Tx) error {
 
 func (s *store) rollback(dbTX *sql.Tx) {
 	err := dbTX.Rollback()
-	if err != nil && !errors.Is(err, sql.ErrTxDone) {
+	// ErrTxDone: already finished. ErrBadConn: the driver dropped the connection, e.g. after a cancelled lock wait;
+	// the database rolls the transaction back itself in that case.
+	if err != nil && !errors.Is(err, sql.ErrTxDone) && !errors.Is(err, driver.ErrBadConn) {
 		s.log.WithError(err).Error("Could not rollback SQL transaction")
 	}
 }
