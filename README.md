@@ -84,6 +84,12 @@ before any read that needs them and at commit, so reading a value written earlie
 `Iterate` and `Range` read in pages and invoke the callbacks between pages, so a callback may run further queries on
 the same transaction.
 
+Cancelling the caller's context aborts the transaction: queries run on that context, it is checked between pages and
+before commit, and the transaction is then rolled back explicitly. The database transaction itself is started on a
+context that cannot be cancelled, so `database/sql` never rolls it back from the background. That background rollback
+is unsafe with go-mssqldb (microsoft/go-mssqldb#390), and this way the rollback always completes before the connection
+is reused.
+
 ### Database notes
 
 - SQL Server: readers run at the database's default isolation. Without `READ_COMMITTED_SNAPSHOT` a reader can briefly

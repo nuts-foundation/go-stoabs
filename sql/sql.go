@@ -200,7 +200,13 @@ func (s *store) doTX(ctx context.Context, fn func(t *tx) error, writable bool, o
 	} else {
 		txOpts = s.dialect.ReadTxOptions()
 	}
-	dbTX, err := s.db.BeginTx(ctx, txOpts)
+	// The transaction itself gets a context that cannot be cancelled: when a transaction's context is cancelled,
+	// database/sql rolls it back from a background goroutine and discards the connection. With go-mssqldb that
+	// rollback is unsafe (microsoft/go-mssqldb#390: the connection, and its pooled read buffer, are reused while the
+	// rollback's response reader is still running). Cancellation is honoured by this code instead: every query runs
+	// on the caller's context, the context is checked before each page and before committing, and the transaction
+	// is always rolled back explicitly, so the rollback completes before the connection is reused.
+	dbTX, err := s.db.BeginTx(context.WithoutCancel(ctx), txOpts)
 	if err != nil {
 		unlock()
 		return stoabs.DatabaseError(err)
@@ -267,6 +273,8 @@ func (s *store) lockForWrite(ctx context.Context, dbTX *sql.Tx) error {
 	return nil
 }
 
+// rollback rolls the transaction back. The transaction's context is never cancelled (see doTX), so this is the only
+// rollback and it completes before the connection returns to the pool.
 func (s *store) rollback(dbTX *sql.Tx) {
 	err := dbTX.Rollback()
 	// ErrTxDone: already finished. ErrBadConn: the driver dropped the connection, e.g. after a cancelled lock wait;
