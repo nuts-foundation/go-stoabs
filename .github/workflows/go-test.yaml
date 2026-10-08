@@ -15,6 +15,52 @@ jobs:
 
     runs-on: ubuntu-latest
 
+    # Databases for the SQL backend's conformance tests. The tests skip a database when its DSN is not set,
+    # so these only need to be here, not when running the tests locally.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: stoabs
+          POSTGRES_PASSWORD: stoabs
+          POSTGRES_DB: stoabs
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U stoabs"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: stoabs
+          MYSQL_DATABASE: stoabs
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pstoabs --silent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: Y
+          MSSQL_SA_PASSWORD: Stoabs!Passw0rd
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P 'Stoabs!Passw0rd' -Q 'SELECT 1'"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 30
+
+    env:
+      STOABS_TEST_POSTGRES_DSN: postgres://stoabs:stoabs@localhost:5432/stoabs?sslmode=disable
+      STOABS_TEST_MYSQL_DSN: root:stoabs@tcp(localhost:3306)/stoabs
+      STOABS_TEST_SQLSERVER_DSN: sqlserver://sa:Stoabs!Passw0rd@localhost:1433?database=master
+
     steps:
       - uses: actions/checkout@v6
       - name: Setup Go
