@@ -22,6 +22,8 @@ import (
 	"context"
 	"github.com/nuts-foundation/go-stoabs"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -93,5 +95,64 @@ func Test_ContextRWLocker(t *testing.T) {
 		err := l.LockContext(ctx)
 		assert.ErrorIs(t, err, context.DeadlineExceeded)
 		assert.ErrorIs(t, err, stoabs.ErrDatabase{})
+	})
+}
+
+// lockAcquiredContext is a cancelled context whose Done() only returns once the
+// locking goroutine has acquired the lock. That forces the interleaving in which
+// the lock is acquired concurrently with the context expiring, which used to
+// deadlock lockWithCancel.
+type lockAcquiredContext struct {
+	context.Context
+	lockAcquired chan struct{}
+}
+
+func (c lockAcquiredContext) Done() <-chan struct{} {
+	<-c.lockAcquired
+	// give the locking goroutine time to get past fnLock() and signal the caller
+	time.Sleep(time.Millisecond)
+	return c.Context.Done()
+}
+
+func Test_lockWithCancel(t *testing.T) {
+	t.Run("lock acquired while context expires does not deadlock and releases the lock", func(t *testing.T) {
+		var locks, unlocks atomic.Int32
+		cancelled, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		// Repeat: the caller picks randomly when both the lock and the expired context are ready.
+		for i := 0; i < 100; i++ {
+			lockAcquired := make(chan struct{})
+			ctx := lockAcquiredContext{Context: cancelled, lockAcquired: lockAcquired}
+			fnLock := func() {
+				locks.Add(1)
+				close(lockAcquired)
+			}
+			fnUnlock := func() {
+				unlocks.Add(1)
+			}
+
+			done := make(chan error, 1)
+			go func() {
+				done <- lockWithCancel(ctx, fnLock, fnUnlock)
+			}()
+
+			select {
+			case err := <-done:
+				if err == nil {
+					// caller got the lock before it noticed the expired context: it owns the lock
+					fnUnlock()
+				} else {
+					assert.ErrorIs(t, err, context.Canceled)
+				}
+			case <-time.After(5 * time.Second):
+				require.FailNowf(t, "deadlock", "lockWithCancel did not return (iteration %d)", i)
+			}
+		}
+
+		// Every acquired lock must be released, either by the caller or by the locking goroutine.
+		assert.Eventually(t, func() bool {
+			return locks.Load() == unlocks.Load()
+		}, 5*time.Second, 10*time.Millisecond, "locks=%d unlocks=%d", locks.Load(), unlocks.Load())
 	})
 }
