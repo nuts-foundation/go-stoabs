@@ -41,6 +41,25 @@ func Test_CallWithTimeout(t *testing.T) {
 			assert.True(t, timeoutFnCalled)
 		})
 
+		t.Run("context already done and fn already returned", func(t *testing.T) {
+			// Regression test: if fn returned before the select ran, the select picked a case at random,
+			// returning nil instead of the context error about half the time.
+			cancelledCtx, cancel := context.WithCancel(context.Background())
+			cancel()
+			for i := 0; i < 100; i++ {
+				ctx := waitForFnContext{Context: cancelledCtx, fnReturned: make(chan struct{})}
+
+				err := CallWithTimeout(ctx, func() error {
+					defer close(ctx.fnReturned)
+					return nil
+				}, func() {})
+
+				if !assert.ErrorIs(t, err, context.Canceled) {
+					return
+				}
+			}
+		})
+
 		t.Run("context.DeadlineExceeded is ErrDatabase", func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
 			defer cancel()
@@ -70,4 +89,18 @@ func Test_CallWithTimeout(t *testing.T) {
 			assert.False(t, timeoutFnCalled)
 		})
 	})
+}
+
+// waitForFnContext is a done context whose Done() only returns after fn has returned,
+// so both cases of the select in CallWithTimeout are ready at the same time.
+type waitForFnContext struct {
+	context.Context
+	fnReturned chan struct{}
+}
+
+func (c waitForFnContext) Done() <-chan struct{} {
+	<-c.fnReturned
+	// give the goroutine time to reach its send on the result channel
+	time.Sleep(time.Millisecond)
+	return c.Context.Done()
 }

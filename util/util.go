@@ -26,10 +26,17 @@ import (
 // CallWithTimeout invokes the given function and waits until either it finishes or the given context finishes.
 // If the context finishes before the function finishes, the timeoutCallback function is invoked.
 func CallWithTimeout(ctx context.Context, fn func() error, timeoutCallback func()) error {
-	closeError := make(chan error)
+	// Buffered, so the goroutine can always send its result and exit, even after a timeout.
+	closeError := make(chan error, 1)
 	go func() {
 		closeError <- fn()
 	}()
+	// Check the context first: if fn returns very quickly, both select cases can be ready
+	// at the same time and select would pick one at random.
+	if ctx.Err() != nil {
+		timeoutCallback()
+		return stoabs.DatabaseError(ctx.Err())
+	}
 	select {
 	case <-ctx.Done():
 		timeoutCallback()
